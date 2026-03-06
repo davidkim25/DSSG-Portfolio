@@ -1,0 +1,500 @@
+---
+title: "Survival Analysis - Hurricane Readiness Project"
+author: "David Kim"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Library & Data
+
+```{r}
+library(survival)
+library(foreign)
+library(ggplot2)
+library(survminer)
+library(rms)
+library(flexsurv)
+library(dplyr)
+library(tidyverse)
+library(ciTools)
+library(here)
+library(visreg)
+library(cmprsk)
+library(reticulate)
+```
+
+```{r}
+library(aws.s3)
+
+# finding the AWS S3 bucket
+bucket_exists(
+  bucket = "s3://survival2024/",
+  region = "us-east-1"
+)
+
+# connecting to the bucket
+files <- get_bucket_df(
+  bucket = "s3://survival2024/",
+  region = "us-east-1",
+  max = 20000
+) %>%
+  as_tibble()
+
+# downloading files in the bucket
+save_object(
+  object = "hurricane.csv",
+  bucket = "s3://survival2024/",
+  region = "us-east-1",
+  file = "hurricane"
+)
+
+# hurricane df
+df <- read.csv("hurricane")
+
+df
+```
+
+```{r}
+# View(df)
+dim(df)
+colnames(df)
+```
+
+### 1) Imputation of Missing Values
+
+##### Decision: We're going to treat NA values of h1 to h48 columns with 0.
+
+```{r}
+# relocating columns for easier imputation
+df <- df |>
+  relocate(survive, hour, reason, reason2, .after = elevation)
+```
+
+```{r}
+# NA values check
+any(is.na(df))
+```
+
+```{r}
+# selecting columns that are h1 to h48
+cols_to_impute <- 13:ncol(df)
+
+# looping through the selected columns and replacing NA with 0
+for (i in cols_to_impute) {
+  df[, i][is.na(df[, i])] <- 0
+}
+
+# view the result
+View(df)
+```
+
+```{r}
+# sanity check
+any(is.na(df))
+```
+
+### 2) Creating a flag for motor failure event
+
+```{r}
+# flag motor is when pump fails due to motor failure
+df$flag_motor <- ifelse(df$survive == 0 & df$reason == 2, 1, 0)
+
+# moving the column for visibility
+df <- df |>
+  relocate(flag_motor, .after = survive)
+
+View(df)
+```
+
+### 3) Cox PH Model with Time-independent variables
+
+```{r}
+# cox proportional hazards model with all time-fixed predictor variables
+df.coxph.full <- coxph(Surv(hour, flag_motor) ~ age + backup + bridgecrane + elevation + gear + servo + slope + trashrack, data = df)
+
+summary(df.coxph.full)
+```
+
+#### 3.1) Treating trashrack
+
+```{r}
+table(df$trashrack, df$flag_motor)
+```
+
+In our dataset, all 112 pumps that failed due to motor failure occurred in the absence of trashrack.
+
+This means the variable trashrack in our dataset perfectly predicts the pump failure due to motor failure.
+
+##### Decision: We will leave out trashrack in our model & address it separately
+
+This was done to allow our model to be generalizable to other datasets
+
+We can recommend the committee to 1) look for this type of pattern in other datasets 2) and if pattern is present in our datasets, then suggest thinking about conducting a pilot experiment where upgrade on trashrack is implemented as a solution to addressing motor failure of pumps
+
+```{r}
+# without trashrack
+df.coxph.full <- coxph(Surv(hour, flag_motor) ~ age + backup + bridgecrane + elevation + gear + servo + slope, data = df)
+
+summary(df.coxph.full)
+```
+
+#### 3.2) Checking Linearity Assumption
+
+For continuous variables, we need to check if they satisfy the linearity assumption of Cox PH model
+
+We will use Martingale residual plots to check linearity of predictors
+
+```{r}
+# Martingale residual plots for checking linearity assumption in predictors
+survminer::ggcoxfunctional(df.coxph.full,data=df)
+```
+
+##### Decision: We will bin the continuous variables to satisfy the linearity assumption of predictors
+
+#### 3.3) Binning Continuous Variables
+
+##### Binning Age
+
+We will bin the continuous variables while trying to avoid quasi-complete or complete separation
+
+```{r}
+# range of age
+sort(unique(df$age))
+```
+
+```{r}
+# distribution of age
+hist(df$age, breaks = 30, main = "Distribution of Age", xlab = "Age")
+```
+
+```{r}
+# binning age into 2 buckets
+# (5-7), (7+)
+
+df <- df |>
+  mutate(
+    age_binned = cut(age, 
+                     breaks = c(-Inf, 7, Inf),
+                     labels = c("(5-7)", "(7+)"))
+  )
+```
+
+```{r}
+# checking the distribution of binned age variable
+df |> 
+    count(age_binned)
+```
+
+```{r}
+# checking for separation in binned age variable
+df |> 
+    count(age_binned, flag_motor) |> 
+    pivot_wider(names_from = flag_motor, 
+                values_from = n)
+```
+
+##### Binning Elevation
+
+```{r}
+sort(unique(df$elevation))
+```
+
+```{r}
+hist(df$elevation, breaks = 30, main = "Distribution of Elevation", xlab = "Elevation")
+```
+
+```{r}
+# binning elevation into 2 buckets
+# (2-3), (3+)
+
+df <- df |>
+  mutate(
+          elevation_binned = cut(elevation,
+                           breaks = c(-Inf, 3, Inf),
+                           labels = c("(2-3)", "(3+)"))
+  )
+```
+
+```{r}
+# checking the distribution of binned elevation variable
+df |> 
+    count(elevation_binned)
+```
+
+```{r}
+# checking for separation in binned elevation variable
+df |> 
+    count(elevation_binned, flag_motor) |> 
+    pivot_wider(names_from = flag_motor, 
+                values_from = n)
+```
+
+##### Binning Slope
+
+```{r}
+sort(unique(df$slope))
+```
+
+```{r}
+hist(df$slope, breaks = 30, main = "Distribution of Slope", xlab = "Slope")
+```
+
+```{r}
+# binning slope into 2 buckets
+# (0-3), (3+)
+
+df <- df |>
+  mutate(
+      slope_binned = cut(slope,
+                       breaks = c(-Inf, 2, Inf),
+                       labels = c("(0-2)", "(2+)"))
+  
+      )
+```
+
+```{r}
+# checking the distribution of binned slope variable
+df |> 
+    count(slope_binned)
+```
+
+```{r}
+# checking for separation in binned slope variable
+df |> 
+    count(slope_binned, flag_motor) |> 
+    pivot_wider(names_from = flag_motor, 
+                values_from = n)
+```
+
+#### 3.4) Cox PH Model with Linearity Assumption Satisfied
+
+```{r}
+df.coxph.full.lin <- coxph(Surv(hour, flag_motor) ~ age_binned + backup + bridgecrane + elevation_binned + gear + servo + slope_binned, data = df)
+
+summary(df.coxph.full.lin)
+```
+
+#### 3.5) Checking for Constant Proportionality of Hazards in the Cox PH Model
+
+This means that the predictor variables should not show interaction with time.
+
+Schoenfeld hypothesis test can be performed on the residuals of the Cox PH model.
+
+The null hypothesis of the Schoenfeld test essentially states that the predictor variable shows no statistically significant interaction with time
+
+The alternative hypothesis of the Schoenfeld test states the predictor variable shows statistically significant interaction with time
+
+Therefore, we want to see high p-values, so that we can fail to reject the null hypothesis
+
+```{r}
+df.coxph.full.lin.zph <- cox.zph(df.coxph.full.lin)
+
+df.coxph.full.lin.zph
+```
+
+##### Passed!
+
+```{r}
+ggcoxzph(df.coxph.full.lin.zph)
+```
+
+### 4) Backward Elimination Selection
+
+Committee uses a significance level of 0.03 & backward elimination selection method
+
+##### Decision: We use Backward elimination selection with the significance level of 0.03
+
+```{r}
+# significance level
+alpha = 0.03
+
+# null model
+df.coxph.null <- coxph(Surv(hour, flag_motor) ~ 1, data = df)
+
+# backward elimination with significance level (alpha)
+df.coxph.bs <- step(df.coxph.full.lin,
+                   scope = list(lower = df.coxph.null,
+                                upper = df.coxph.full.lin),
+                   direction = "backward", 
+                   k = qchisq(alpha, 1,lower.tail = FALSE)
+                   ) 
+```
+
+```{r}
+summary(df.coxph.bs)
+```
+
+##### Other Backward Elimination Selection Methods
+
+```{r}
+# Backward Elimination with AIC
+df.coxph.bs.AIC <- step(df.coxph.full.lin,
+                   scope = list(lower = df.coxph.null,
+                                upper = df.coxph.full.lin),
+                   direction = "backward", 
+                   k = 2
+                   ) 
+```
+
+```{r}
+summary(df.coxph.bs.AIC)
+```
+
+```{r}
+# Backward Elimination with BIC
+df.coxph.bs.BIC <- step(df.coxph.full.lin,
+                   scope = list(lower = df.coxph.null,
+                                upper = df.coxph.full.lin),
+                   direction = "backward", 
+                   k = log(nrow(df))
+                   ) 
+```
+
+#### 4.1) P-value table of Significant Variables
+
+```{r}
+ranked_pval_tbl <- as.data.frame(summary(df.coxph.bs)$coefficients) |>
+  tibble::rownames_to_column("variable") |>
+  arrange(`Pr(>|z|)`)
+
+ranked_pval_tbl
+```
+
+#### 4.2) Interpretation of Effects of the Most Significant Variable
+
+Our most significant variable is the age variable, but we binned this variable into 2 buckets: (5-7) and (7+)
+
+By binning the age variable, we have to recognize that we sacrificed interpretability for model validity.
+
+```{r}
+100*(0.2418283-1)
+```
+
+##### Interpretation
+
+"Based on our Cox PH model, age was the strongest predictor of motor failure hazard in pumps. However, it should be noted that we decided to bin the age variable for model validity at the expense of interpretability. Therefore, our interpretation is limited to stating that, while holding all other factors constant, motors that are 7 years or older have approximately 76% lower hazard compared to motors that are 5 to 7 years old."
+
+## Cox Regression Model with Time-Dependent Variable
+
+### 0) Assumptions
+
+We treated NA as 0
+
+h1-h48: "Accuracy of pump status not guaranteed to be error free" –\> We believed what they put down
+
+### 1) Counting Process Structure
+
+```{r}
+# 1) selecting only relevant columns
+# taking columns OUT (-c)
+df_cp_base <- df |>
+    select(-c(reason, reason2, bridgecrane, gear, trashrack, elevation, backup, survive))
+
+df_cp_base <- df_cp_base |>
+    select(-c(age, servo, slope, elevation_binned))
+
+# creating index
+df_cp_base$index = seq_len(nrow(df_cp_base))
+
+df_cp_base <- df_cp_base |>
+    relocate(index, .before = flag_motor)
+
+df_cp_base <- df_cp_base |>
+    relocate(age_binned, slope_binned, .after = flag_motor)
+
+any(is.na(df_cp_base))
+View(df_cp_base)
+```
+
+```{r}
+# 2) pivot h1:h48 to long format
+df_cp <- df_cp_base |>
+      pivot_longer(
+    cols = matches("^h\\d"),    
+    names_to = "stop", 
+    values_to = "motor_switch"
+  )
+
+View(df_cp)
+```
+
+```{r}
+# 3) convert 'stop' (e.g., "h1", "h2") to numeric (1, 2)
+df_cp <- df_cp |>
+    mutate(stop = as.numeric(str_remove(stop, "h")))
+
+View(df_cp)
+```
+
+```{r}
+# 4) only keep up to the hour of failure/censoring
+df_cp <- df_cp |>
+    filter(stop <= hour)
+
+View(df_cp)
+```
+
+```{r}
+# 5) create 'Start' column
+df_cp <- df_cp |>
+    mutate(start = stop - 1) |>
+    relocate(start, .before = stop)
+
+View(df_cp)
+```
+
+```{r}
+# 6) create Consecutive Running Hour counter
+df_cp <- df_cp |>
+  group_by(index) |>
+  mutate(
+    consecutive_running_hours = accumulate(motor_switch, ~ ifelse(.y == 1, .x + .y, 0), .init = 0)[-1]
+  ) |>
+  ungroup()
+
+View(df_cp)
+```
+
+```{r}
+# 7) create over_consec_12hrs_flag
+df_cp <- df_cp |>
+  group_by(index) |>
+    mutate(
+        over_consec_12hrs_flag = if_else(consecutive_running_hours >= 12, 1, 0)
+    ) |>
+    ungroup()
+
+View(df_cp)
+```
+
+```{r}
+# 8) create 'flag_motor_failed' column
+df_cp <- df_cp |>
+  group_by(index) |>
+  mutate(
+    flag_motor_failed = ifelse(flag_motor == 0, 0,   # censored gets 0 all the way
+                        ifelse(stop == hour, 1, 0))  # event gets 1 when stop
+  ) |>
+  ungroup() |>
+    relocate(flag_motor_failed, .after = stop)
+
+View(df_cp)
+```
+
+### 2) Adding Time-Dependent variable to the Cox PH Model
+
+```{r}
+df.coxph.time_dep <- coxph(Surv(start, stop, flag_motor_failed) ~ age_binned + slope_binned + over_consec_12hrs_flag,
+                           data = df_cp)
+
+summary(df.coxph.time_dep)
+```
+
+#### Interpretation
+
+We created a time-dependent variable that indicates if the motor was running for over 12 hours at the time of motor pump failure.
+We added this variable to the Cox PH model with significant predictor variables that met the requirements of linearity and time-independence (shown earlier).
+Inside this model, this time dependent variable was shown to be not statistically significant in its impact, meaning that the over-drive of motor for 12+ consecutive hours didn't seem to play a significant role in increasing the hazard of motor pump failures.
